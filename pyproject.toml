@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-media-pipeline"
+version = "0.3.0"
+description = "Deliberately vulnerable AWS/Python/Terraform benchmark repository for the analysis platform agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Cloud Media Pipeline Maintainers" }]
+keywords = ["benchmark", "aws", "security-lab", "finops"]
+
+# NOTE (benchmark): constraints below are deliberately loose/pinned-old so that
+# dependency-audit tooling has something real to report. See docs/security-lab.md.
+# No CVE claims are made here; run `make audit` for actual advisory data.
+dependencies = [
+    "boto3>=1.26,<1.27",      # CMP-DEP-001 pinned to an old minor series
+    "botocore>=1.29,<1.30",
+    "httpx>=0.23",            # CMP-DEP-002 unbounded upper range
+    "pydantic>=1.10,<2",      # CMP-DEP-003 stuck on pydantic v1
+    "python-dateutil>=2.8",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "moto[s3,sqs,dynamodb]>=4.2",
+    "ruff>=0.1.9",
+    "bandit>=1.7",
+    "pip-audit>=2.6",
+]
+
+[project.urls]
+Documentation = "https://example.invalid/cloud-pipeline/docs"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["unit-tests", "functional-tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+markers = [
+    "aws: requires real or emulated AWS endpoints; skipped unless PIPELINE_ENABLE_AWS_TESTS=1",
+    "slow: long-running benchmark test",
+]
+
+[tool.coverage.run]
+source = ["cloud_pipeline"]
+branch = true
+
+[tool.coverage.report]
+# NOTE (benchmark): no fail_under gate on purpose. Coverage is meant to be low
+# and honestly reported, not enforced. See benchmark/scoring-rubric.md.
+show_missing = true
+skip_empty = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "C90", "N", "UP"]
+# NOTE (benchmark): the ignores below hide real smells on purpose (CMP-CFG-002).
+ignore = ["S101", "S105", "S106", "B008", "E501", "C901", "S311", "S608"]
+
+[tool.ruff.lint.per-file-ignores]
+"unit-tests/*" = ["S", "N"]
+"functional-tests/*" = ["S", "N"]
+
+[tool.bandit]
+exclude_dirs = ["unit-tests", "functional-tests", ".venv"]
+# NOTE (benchmark): skipping these checks suppresses findings on purpose (CMP-CFG-003).
+skips = ["B101", "B311"]
+

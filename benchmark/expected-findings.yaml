@@ -1,0 +1,1254 @@
+# Ground-truth findings for cloud-media-pipeline
+#
+# This file is the scoring baseline. Every entry below was verified to exist at
+# the stated path after the code was written — these are not aspirational.
+#
+# Monetary impact is expressed as an ORDER OF MAGNITUDE band plus an estimation
+# method. No entry claims a precise saving. Run scripts/estimate_costs.py to
+# produce figures from editable assumptions.
+#
+# Bands: trivial (<$10/mo) | low ($10-100) | moderate ($100-1k)
+#        high ($1k-10k)    | very_high (>$10k)
+
+metadata:
+  repository: cloud-media-pipeline
+  schema_version: 1
+  generated_for: automated cloud/code analysis benchmarking
+  verified_against_tree: true
+  disclaimer: >
+    Deliberately vulnerable benchmark. Impact bands are estimates derived from the
+    assumptions in scripts/estimate_costs.py, not quotes. Validate every cost claim
+    against Cost Explorer and CloudWatch before acting on it.
+
+summary:
+  total_findings: 48
+  by_category:
+    cost: 26
+    security: 12
+    code_health: 6
+    dependency: 2
+    test_coverage: 1
+    configuration: 1
+  cost_share_percent: 54
+
+findings:
+
+  # =========================================================================
+  # COST — compute
+  # =========================================================================
+
+  - id: CMP-COST-001
+    category: cost
+    subcategory: compute
+    severity: high
+    confidence: medium
+    file: terraform/ec2.tf
+    resource: aws_instance.worker
+    evidence: >
+      instance_type = var.worker_instance_type (default "m5.4xlarge", 16 vCPU / 64 GiB)
+      with no Auto Scaling group, no stop schedule and Schedule = "none" tag.
+    why_it_matters: >
+      A 16-vCPU instance billed 744 hours a month for a queue consumer that idles
+      outside business hours. Two independent levers apply: right-sizing and scheduling.
+    impact_band: moderate
+    estimation_method: >
+      on_demand_hourly_rate x 730 x instance_count, compared against a right-sized
+      class at business-hours-only runtime.
+    recommendation: >
+      Right-size toward m5.large or Graviton m7g.large, add an EventBridge start/stop
+      schedule, or fold the workload into the existing process Lambda and delete the instance.
+    tradeoffs: >
+      A stop schedule introduces startup latency for out-of-hours jobs. Confirm the
+      queue is genuinely idle overnight before scheduling.
+    validation: >
+      AWS Compute Optimizer recommendation plus 30 days of CloudWatch CPUUtilization
+      and SQS ApproximateNumberOfMessagesVisible.
+
+  - id: CMP-COST-031
+    category: cost
+    subcategory: compute
+    severity: high
+    confidence: high
+    file: terraform/ec2.tf
+    resource: aws_instance.worker
+    evidence: No schedule, no ASG, no Spot configuration; tag Schedule = "none".
+    why_it_matters: 744 billed hours/month against roughly 160 hours of actual demand.
+    impact_band: moderate
+    estimation_method: (744 - 160) x hourly_rate.
+    recommendation: EventBridge Scheduler start/stop rules, or an ASG scaled on queue depth.
+    tradeoffs: Cold start on first out-of-hours job.
+    validation: CloudWatch CPUUtilization histogram by hour-of-day.
+
+  - id: CMP-COST-032
+    category: cost
+    subcategory: purchasing
+    severity: medium
+    confidence: low
+    file: terraform/ec2.tf
+    resource: aws_instance.worker
+    evidence: On-demand pricing for a permanently running instance.
+    why_it_matters: >
+      If the instance must stay up, on-demand is the most expensive way to run it.
+      This is a REVIEW CANDIDATE — committing to a Savings Plan before right-sizing
+      locks in the oversized footprint.
+    impact_band: low
+    estimation_method: Compare on-demand vs 1-year Compute Savings Plan rate.
+    recommendation: Right-size first (CMP-COST-001), then evaluate a Savings Plan on the residual.
+    tradeoffs: Savings Plans are a 1 or 3 year commitment. Do not commit to waste.
+    validation: Cost Explorer Savings Plan recommendations after right-sizing.
+
+  - id: CMP-COST-033
+    category: cost
+    subcategory: storage
+    severity: medium
+    confidence: high
+    file: terraform/ec2.tf
+    resource: aws_instance.worker.root_block_device
+    evidence: volume_type = "gp2", volume_size = 500.
+    why_it_matters: gp2 is more expensive per GiB than gp3 and ties IOPS to volume size.
+    impact_band: low
+    estimation_method: (gp2_gb_rate - gp3_gb_rate) x allocated_gb.
+    recommendation: Migrate to gp3 and shrink to measured usage.
+    tradeoffs: Shrinking requires snapshot-and-restore, i.e. downtime.
+    validation: df output from the instance plus CloudWatch VolumeQueueDepth.
+
+  - id: CMP-COST-034
+    category: cost
+    subcategory: storage
+    severity: high
+    confidence: high
+    file: terraform/ec2.tf
+    resource: aws_instance.worker.ebs_block_device
+    evidence: volume_type = "io1", volume_size = 1024, iops = 10000 for a scratch directory.
+    why_it_matters: >
+      Provisioned IOPS is among the most expensive EBS options and is billed per
+      provisioned IOP per month regardless of use.
+    impact_band: moderate
+    estimation_method: (io1_gb_rate x 1024) + (io1_iops_rate x 10000) vs gp3 equivalent.
+    recommendation: Move to gp3 with baseline IOPS; scratch data rarely justifies io1.
+    tradeoffs: If the transcoder genuinely saturates IOPS, latency regresses.
+    validation: CloudWatch VolumeQueueDepth and VolumeReadOps/VolumeWriteOps over 30 days.
+
+  - id: CMP-COST-035
+    category: cost
+    subcategory: networking
+    severity: low
+    confidence: high
+    file: terraform/ec2.tf
+    resource: aws_eip.worker_reserved
+    evidence: Elastic IP allocated with no association, tagged "reserved for a future requirement".
+    why_it_matters: Unassociated Elastic IPs are billed hourly.
+    impact_band: trivial
+    estimation_method: idle_eip_hourly_rate x 730.
+    recommendation: Release it; allocate on demand if a static IP is ever needed.
+    tradeoffs: The specific address is lost.
+    validation: "aws ec2 describe-addresses filtered for entries with no AssociationId."
+
+  # =========================================================================
+  # COST — serverless
+  # =========================================================================
+
+  - id: CMP-COST-003
+    category: cost
+    subcategory: serverless
+    severity: medium
+    confidence: medium
+    file: terraform/variables.tf
+    resource: var.ingest_lambda_memory_mb
+    evidence: default = 3008 for a handler that parses a small JSON body.
+    why_it_matters: Lambda bills GB-seconds; memory is a direct multiplier on every invocation.
+    impact_band: low
+    estimation_method: invocations x duration_s x (memory_gb) x gb_second_rate.
+    recommendation: Run AWS Lambda Power Tuning rather than guessing a value.
+    tradeoffs: >
+      Lambda scales CPU with memory, so reducing memory can increase duration and
+      partly offset the saving. Power Tuning measures the actual cost/latency curve.
+    validation: CloudWatch Logs Insights on "Max Memory Used" from REPORT lines over 30 days.
+
+  - id: CMP-COST-004
+    category: cost
+    subcategory: serverless
+    severity: medium
+    confidence: medium
+    file: terraform/variables.tf
+    resource: var.process_lambda_memory_mb
+    evidence: default = 4096 against a measured peak around 180 MB.
+    why_it_matters: Same GB-second multiplier, on the highest-volume function.
+    impact_band: low
+    estimation_method: As CMP-COST-003.
+    recommendation: >
+      Fix CMP-COST-052 (whole-object reads) first — the memory requirement is a
+      symptom of that — then Power Tune.
+    tradeoffs: Blocked on the streaming change; reducing memory alone will cause OOM.
+    validation: Logs Insights on Max Memory Used.
+
+  - id: CMP-COST-005
+    category: cost
+    subcategory: serverless
+    severity: low
+    confidence: high
+    file: terraform/locals.tf
+    resource: local.uniform_timeout
+    evidence: A single 900s timeout applied to all four functions regardless of workload.
+    why_it_matters: >
+      A long timeout costs nothing by itself, but a hung invocation bills for 15
+      minutes at 4096 MB instead of failing fast.
+    impact_band: trivial
+    estimation_method: hung_invocations x 900s x memory_gb x gb_second_rate.
+    recommendation: Set per-function timeouts at roughly 3x observed p99 duration.
+    tradeoffs: Too tight a timeout fails legitimately slow jobs. Cleanup genuinely needs minutes.
+    validation: Per-function Duration p99 from CloudWatch.
+
+  - id: CMP-COST-006
+    category: cost
+    subcategory: serverless
+    severity: medium
+    confidence: medium
+    file: terraform/variables.tf
+    resource: var.process_reserved_concurrency
+    evidence: default = 200 against an observed peak around 12.
+    why_it_matters: >
+      Reserved concurrency is not billed directly but permanently removes 200 units
+      from the account's shared pool, starving other functions.
+    impact_band: trivial
+    estimation_method: Not directly billable; measure contention instead.
+    recommendation: Set to roughly 2x observed peak, or remove the reservation.
+    tradeoffs: Too low a reservation throttles the function under a genuine spike.
+    validation: Lambda ConcurrentExecutions p99 and account-level Throttles.
+
+  - id: CMP-COST-028
+    category: cost
+    subcategory: serverless
+    severity: high
+    confidence: high
+    file: terraform/lambda.tf
+    resource: aws_lambda_provisioned_concurrency_config.process
+    evidence: provisioned_concurrent_executions = 20 on an SQS-driven function.
+    why_it_matters: >
+      Provisioned concurrency is billed for every second it is allocated, whether or
+      not a message arrives. It buys cold-start elimination, which asynchronous queue
+      processing does not need.
+    impact_band: moderate
+    estimation_method: units x memory_gb x provisioned_rate_per_gb_second x 2628000s.
+    recommendation: Remove it entirely.
+    tradeoffs: Cold starts return — irrelevant for a queue consumer. Verify no synchronous caller uses the alias.
+    validation: Lambda ProvisionedConcurrencyUtilization; low utilisation confirms waste.
+
+  - id: CMP-COST-030
+    category: cost
+    subcategory: serverless
+    severity: medium
+    confidence: medium
+    file: terraform/lambda.tf
+    resource: aws_lambda_function_event_invoke_config.process
+    evidence: maximum_retry_attempts = 2 layered on top of an SQS maxReceiveCount of 1000.
+    why_it_matters: Retry budgets at different layers multiply rather than add.
+    impact_band: low
+    estimation_method: Compare SQS NumberOfMessagesReceived against Lambda Invocations.
+    recommendation: Pick one retry authority. For SQS-driven functions, let the redrive policy own it.
+    tradeoffs: None material.
+    validation: Invocation-to-message ratio in CloudWatch.
+
+  # =========================================================================
+  # COST — messaging
+  # =========================================================================
+
+  - id: CMP-COST-007
+    category: cost
+    subcategory: messaging
+    severity: medium
+    confidence: high
+    files:
+      - terraform/sqs.tf
+      - src/cloud_pipeline/clients/sqs_client.py
+    resource: aws_sqs_queue.jobs
+    evidence: >
+      receive_wait_time_seconds = 0 in Terraform and WaitTimeSeconds=0 in
+      sqs_client.receive_messages, with a 100ms sleep loop in queue_worker.poll_loop.
+    why_it_matters: >
+      Short polling means an idle consumer issues a billed empty ReceiveMessage as
+      fast as the network allows. This is a cross-file finding: both layers must change.
+    impact_band: trivial
+    estimation_method: empty_receives_per_month x sqs_request_rate.
+    recommendation: Set receive_wait_time_seconds = 20 and WaitTimeSeconds = 20.
+    tradeoffs: None. Long polling also reduces delivery latency.
+    validation: SQS NumberOfEmptyReceives before and after.
+
+  - id: CMP-COST-008
+    category: cost
+    subcategory: messaging
+    severity: critical
+    confidence: medium
+    files:
+      - terraform/sqs.tf
+      - terraform/lambda.tf
+    resource: aws_sqs_queue.jobs
+    evidence: visibility_timeout_seconds = 30 against a Lambda timeout of 900.
+    why_it_matters: >
+      A message becomes visible again while still being processed, so the same job is
+      handled repeatedly and concurrently. With no idempotency guard (CMP-CODE-037)
+      this both multiplies cost and corrupts job state.
+    impact_band: low
+    estimation_method: >
+      (SQS NumberOfMessagesReceived / unique messages) gives the duplication factor;
+      multiply by per-invocation cost.
+    recommendation: Set visibility timeout to at least 6x the function timeout.
+    tradeoffs: A longer visibility timeout delays retry of genuinely failed messages.
+    validation: Ratio of NumberOfMessagesReceived to Lambda Invocations.
+
+  - id: CMP-COST-021
+    category: cost
+    subcategory: messaging
+    severity: high
+    confidence: high
+    file: terraform/sqs.tf
+    resource: aws_sqs_queue.jobs.redrive_policy
+    evidence: maxReceiveCount = 1000.
+    why_it_matters: A single poison message can trigger up to 1000 full-cost Lambda invocations.
+    impact_band: low
+    estimation_method: poison_message_count x 1000 x per_invocation_cost.
+    recommendation: Reduce to around 5.
+    tradeoffs: Transient failures reach the DLQ sooner, so the DLQ needs an owner and a redrive runbook.
+    validation: DLQ depth and ApproximateReceiveCount distribution on sampled messages.
+
+  - id: CMP-COST-023
+    category: cost
+    subcategory: messaging
+    severity: medium
+    confidence: high
+    file: terraform/sqs.tf
+    resource: aws_lambda_event_source_mapping.jobs_to_process
+    evidence: batch_size = 1.
+    why_it_matters: One Lambda invocation per message; a batch of 10 does the same work for a tenth of the invocations.
+    impact_band: trivial
+    estimation_method: invocations x request_rate, compared at batch sizes 1 and 10.
+    recommendation: >
+      Raise batch_size to 10 — but only after queue_worker handles batches correctly
+      and reports partial failures (CMP-CODE-040).
+    tradeoffs: Blocked on the partial-batch-failure fix, or one bad record fails nine good ones.
+    validation: Lambda Invocations vs SQS NumberOfMessagesDeleted.
+
+  - id: CMP-COST-020
+    category: cost
+    subcategory: messaging
+    severity: low
+    confidence: medium
+    file: terraform/sqs.tf
+    resource: aws_sqs_queue.jobs_dlq
+    evidence: message_retention_seconds = 1209600 (14 days) with no consumer or redrive process.
+    why_it_matters: Failed messages accumulate and are stored for the maximum window with no owner.
+    impact_band: trivial
+    estimation_method: Storage is not separately billed; the cost is operational, not financial.
+    recommendation: Add a DLQ alarm with a real action and a documented redrive runbook.
+    tradeoffs: None.
+    validation: DLQ ApproximateNumberOfMessagesVisible trend.
+
+  - id: CMP-COST-022
+    category: cost
+    subcategory: messaging
+    severity: low
+    confidence: medium
+    file: terraform/sqs.tf
+    resource: aws_sqs_queue.billing_fifo
+    evidence: receive_wait_time_seconds = 0; high-throughput FIFO mode not enabled.
+    why_it_matters: Same empty-receive tax as CMP-COST-007 on a second queue.
+    impact_band: trivial
+    estimation_method: As CMP-COST-007.
+    recommendation: Enable long polling; enable high-throughput mode if ordering is per-group.
+    tradeoffs: High-throughput FIFO changes deduplication scope.
+    validation: NumberOfEmptyReceives on the FIFO queue.
+
+  # =========================================================================
+  # COST — database
+  # =========================================================================
+
+  - id: CMP-COST-011
+    category: cost
+    subcategory: scheduling
+    severity: critical
+    confidence: medium
+    files:
+      - terraform/eventbridge.tf
+      - src/cloud_pipeline/services/report_service.py
+    resource: aws_cloudwatch_event_rule.report_schedule
+    evidence: >
+      schedule_expression = "rate(1 minute)" driving report_service.generate_report,
+      which calls dynamodb_client.scan_all_jobs — a full table scan.
+    why_it_matters: >
+      43,200 full table scans a month to regenerate a summary read once a day. This is
+      the single largest seeded opportunity and requires reasoning across two files.
+    impact_band: high
+    estimation_method: >
+      invocations x (table_size_kb / 4) RRU x read_rate x 2 (strongly consistent),
+      plus Lambda GB-seconds.
+    recommendation: >
+      Two independent fixes: (1) rate(1 minute) -> rate(1 day); (2) replace the Scan
+      with a Query against the existing status-index GSI.
+    tradeoffs: Daily reporting loses near-real-time visibility; confirm with stakeholders.
+    validation: DynamoDB ConsumedReadCapacityUnits by operation and Lambda Invocations.
+
+  - id: CMP-COST-058
+    category: cost
+    subcategory: database
+    severity: critical
+    confidence: high
+    file: src/cloud_pipeline/clients/dynamodb_client.py
+    symbol: scan_all_jobs
+    evidence: >
+      table.scan() paginating the whole table. Called by report_service.generate_report,
+      report_service.generate_customer_report, billing_service.build_monthly_invoice
+      and job_repository.list_expired.
+    why_it_matters: >
+      Scan consumes RCU proportional to total table size, not to matching records. With
+      TTL disabled (CMP-COST-025) the table never shrinks, so this cost grows forever.
+    impact_band: high
+    estimation_method: (table_size_kb / 4) x RRU rate x call frequency.
+    recommendation: Replace all four call sites with Query against status-index or customer-index.
+    tradeoffs: Requires defining access patterns properly; some callers may need both indexes.
+    validation: ConsumedReadCapacityUnits split by Scan vs Query.
+
+  - id: CMP-COST-012
+    category: cost
+    subcategory: database
+    severity: medium
+    confidence: low
+    file: terraform/dynamodb.tf
+    resource: aws_dynamodb_table.jobs
+    evidence: billing_mode = "PAY_PER_REQUEST" on a described steady workload.
+    why_it_matters: >
+      On-demand costs roughly 6-7x provisioned per request unit. For a genuinely
+      steady workload, provisioned with autoscaling is usually cheaper.
+    impact_band: low
+    estimation_method: Compare 30 days of consumed capacity against provisioned pricing with autoscaling headroom.
+    recommendation: >
+      REVIEW CANDIDATE, not an automatic change. Validate the traffic shape first —
+      on-demand remains correct if traffic is genuinely spiky.
+    tradeoffs: >
+      Provisioned capacity throttles when traffic exceeds the configured ceiling.
+      Autoscaling reacts in minutes, not seconds.
+    validation: 30+ days of ConsumedReadCapacityUnits and ConsumedWriteCapacityUnits.
+
+  - id: CMP-COST-024
+    category: cost
+    subcategory: database
+    severity: high
+    confidence: medium
+    files:
+      - terraform/dynamodb.tf
+      - src/cloud_pipeline/services/ingest_service.py
+    resource: aws_dynamodb_table.jobs.global_secondary_index
+    evidence: >
+      Both status-index and customer-index use projection_type = "ALL", while
+      ingest_service.build_job_record stores the full inbound body as raw_payload.
+    why_it_matters: Every base-table write is replicated in full into both indexes — a 3x write multiplier.
+    impact_band: low
+    estimation_method: base_wru x 3 vs base_wru x (1 + projected_fraction x 2).
+    recommendation: Switch to KEYS_ONLY or INCLUDE; move raw_payload to S3 with a pointer in the item.
+    tradeoffs: KEYS_ONLY forces a follow-up GetItem for unprojected attributes.
+    validation: ConsumedWriteCapacityUnits split by table vs index.
+
+  - id: CMP-COST-025
+    category: cost
+    subcategory: database
+    severity: high
+    confidence: high
+    file: terraform/dynamodb.tf
+    resource: aws_dynamodb_table.jobs.ttl
+    evidence: >
+      ttl { attribute_name = "expires_at", enabled = false }, while
+      ingest_service.build_job_record populates expires_at on every record.
+    why_it_matters: >
+      The data to expire records exists and is ignored. The table and both
+      ALL-projection GSIs grow without bound, which in turn inflates every Scan.
+    impact_band: moderate
+    estimation_method: Unbounded growth; compare storage cost with and without a 30-day TTL.
+    recommendation: Set enabled = true. DynamoDB TTL deletions are free.
+    tradeoffs: Records disappear after 30 days; confirm no compliance retention requirement.
+    validation: Table ItemCount and TableSizeBytes trend.
+
+  - id: CMP-COST-026
+    category: cost
+    subcategory: database
+    severity: low
+    confidence: medium
+    file: terraform/dynamodb.tf
+    resource: aws_dynamodb_table.jobs.point_in_time_recovery
+    evidence: enabled = true on a reconstructible dev table.
+    why_it_matters: PITR adds continuous backup charges proportional to table size.
+    impact_band: trivial
+    estimation_method: table_size_gb x pitr_gb_rate.
+    recommendation: Disable for dev; keep for production.
+    tradeoffs: Loses second-level restore granularity.
+    validation: Cost Explorer filtered to DynamoDB backup usage types.
+
+  - id: CMP-COST-027
+    category: cost
+    subcategory: database
+    severity: low
+    confidence: medium
+    file: terraform/dynamodb.tf
+    resource: aws_dynamodb_table.jobs
+    evidence: stream_enabled = true with NEW_AND_OLD_IMAGES and no consumer anywhere in the repository.
+    why_it_matters: Stream read requests are billed; NEW_AND_OLD_IMAGES doubles the record size.
+    impact_band: trivial
+    estimation_method: Negligible without a consumer, but confirm none exists outside this repo.
+    recommendation: Disable the stream, or narrow to KEYS_ONLY if a future consumer is planned.
+    tradeoffs: Re-enabling a stream starts a new stream ARN.
+    validation: "aws dynamodbstreams describe-stream and search for consumers."
+
+  - id: CMP-COST-057
+    category: cost
+    subcategory: database
+    severity: low
+    confidence: high
+    file: src/cloud_pipeline/clients/dynamodb_client.py
+    symbol: get_job
+    evidence: ConsistentRead=True on a read that tolerates eventual consistency.
+    why_it_matters: Strongly consistent reads cost twice as much as eventually consistent ones.
+    impact_band: trivial
+    estimation_method: read_count x (strong_rate - eventual_rate).
+    recommendation: Drop ConsistentRead unless read-after-write is genuinely required.
+    tradeoffs: A just-written record may briefly be stale.
+    validation: ConsumedReadCapacityUnits before and after.
+
+  - id: CMP-COST-059
+    category: cost
+    subcategory: database
+    severity: low
+    confidence: high
+    file: src/cloud_pipeline/workers/cleanup_worker.py
+    symbol: purge_expired_jobs
+    evidence: One delete_item per record in a Python loop.
+    why_it_matters: Consumes write capacity for deletions that DynamoDB TTL performs free of charge.
+    impact_band: trivial
+    estimation_method: deleted_items x WRU rate.
+    recommendation: Enable TTL (CMP-COST-025) and delete this code path. Otherwise use batch_writer().
+    tradeoffs: TTL deletion is best-effort within 48 hours, not immediate.
+    validation: ConsumedWriteCapacityUnits attributable to deletes.
+
+  # =========================================================================
+  # COST — storage
+  # =========================================================================
+
+  - id: CMP-COST-009
+    category: cost
+    subcategory: storage
+    severity: high
+    confidence: medium
+    file: terraform/s3.tf
+    resource: aws_s3_bucket_lifecycle_configuration.input
+    evidence: >
+      noncurrent_version_expiration.noncurrent_days = 1825 with versioning enabled,
+      no transition rules and no abort_incomplete_multipart_upload.
+    why_it_matters: >
+      Every overwrite of a large media object keeps a full copy in Standard storage
+      for five years. Failed multipart uploads accumulate as invisible billable storage.
+    impact_band: moderate
+    estimation_method: monthly_ingest_gb x copy_factor x standard_gb_rate x retention_months.
+    recommendation: >
+      Expire noncurrent versions after 30 days, add Standard-IA / Glacier IR
+      transitions, and abort incomplete multipart uploads after 7 days.
+    tradeoffs: Shorter noncurrent retention reduces the accidental-overwrite recovery window.
+    validation: S3 Storage Lens and BucketSizeBytes split by storage class and version status.
+
+  - id: CMP-COST-053
+    category: cost
+    subcategory: storage
+    severity: high
+    confidence: high
+    file: src/cloud_pipeline/workers/queue_worker.py
+    symbol: process_message
+    evidence: Two copy_object calls moving each object through working/ then archive/ prefixes.
+    why_it_matters: >
+      Three full copies of every media object, in a versioned bucket with five-year
+      noncurrent retention. Compounds directly with CMP-COST-009.
+    impact_band: moderate
+    estimation_method: monthly_ingest_gb x 3 x standard_gb_rate, plus COPY request charges.
+    recommendation: Track pipeline state with object tags or a DynamoDB field instead of physically moving objects.
+    tradeoffs: Prefix-based state is visible in a bucket listing; tags are not.
+    validation: S3 Storage Lens object count by prefix.
+
+  - id: CMP-COST-052
+    category: cost
+    subcategory: storage
+    severity: high
+    confidence: high
+    file: src/cloud_pipeline/clients/s3_client.py
+    symbol: get_object_bytes
+    evidence: response["Body"].read() loads the entire object into memory; body never closed.
+    why_it_matters: >
+      This is the root cause of the 4096 MB process Lambda (CMP-COST-004) — the memory
+      is provisioned purely to hold objects the transform does not need in full.
+    impact_band: low
+    estimation_method: Lambda GB-second delta between 4096 MB and a streamed-equivalent 512 MB.
+    recommendation: Stream in CHUNK_BYTES blocks, or issue a byte-range request for the header only.
+    tradeoffs: Streaming complicates the transform slightly.
+    validation: Logs Insights on Max Memory Used after the change.
+
+  - id: CMP-COST-054
+    category: cost
+    subcategory: storage
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/workers/cleanup_worker.py
+    symbol: purge_objects
+    evidence: delete_object called once per key in a loop.
+    why_it_matters: delete_objects removes up to 1000 keys per request; one-at-a-time multiplies request cost and billed Lambda duration.
+    impact_band: trivial
+    estimation_method: key_count x DELETE request rate, plus the Lambda duration difference.
+    recommendation: Batch with delete_objects.
+    tradeoffs: Batch responses require per-key error handling.
+    validation: S3 request metrics by operation.
+
+  - id: CMP-COST-060
+    category: cost
+    subcategory: storage
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/services/report_service.py
+    symbol: generate_report
+    evidence: A new timestamped report object written on every run, plus a duplicate write to reports/latest.json.
+    why_it_matters: >
+      At one run per minute that is 43,200 objects a month, each written twice, into a
+      prefix whose lifecycle rule only transitions after 400 days and never expires.
+    impact_band: low
+    estimation_method: objects_per_month x 2 x (PUT rate + storage).
+    recommendation: Write only to the fixed latest key, and expire historical reports after 30 days.
+    tradeoffs: Loses the per-run history; keep a daily snapshot if an audit trail is needed.
+    validation: Object count under reports/ via Storage Lens.
+
+  - id: CMP-COST-019
+    category: cost
+    subcategory: storage
+    severity: medium
+    confidence: medium
+    file: terraform/s3.tf
+    resource: aws_s3_bucket_lifecycle_configuration.output
+    evidence: The only rule is filtered to prefix "reports/"; the temp/ and processed/ prefixes have no rule at all.
+    why_it_matters: Intermediate artefacts the pipeline never reads again are retained indefinitely.
+    impact_band: low
+    estimation_method: temp_prefix_gb x standard_gb_rate x months_retained.
+    recommendation: Add an expiration rule for temp/ and a transition for processed/.
+    tradeoffs: Confirm nothing reads these prefixes before expiring them.
+    validation: S3 Storage Lens by prefix, plus access logs if enabled.
+
+  # =========================================================================
+  # COST — networking
+  # =========================================================================
+
+  - id: CMP-COST-002
+    category: cost
+    subcategory: networking
+    severity: high
+    confidence: high
+    file: terraform/networking.tf
+    resource: aws_nat_gateway.lab
+    evidence: NAT Gateway present; no aws_vpc_endpoint resource exists anywhere in the module.
+    why_it_matters: >
+      All S3 and DynamoDB traffic from private subnets is billed as NAT data
+      processing. Gateway VPC endpoints are free and remove this traffic entirely.
+    impact_band: moderate
+    estimation_method: nat_hourly x 730 + (monthly_gb x nat_per_gb_rate).
+    recommendation: Add S3 and DynamoDB gateway endpoints attached to both private route tables.
+    tradeoffs: None material — gateway endpoints are route-table entries.
+    validation: NAT Gateway BytesOutToDestination before and after.
+
+  - id: CMP-COST-016
+    category: cost
+    subcategory: networking
+    severity: high
+    confidence: high
+    file: terraform/networking.tf
+    evidence: Documented absence of aws_vpc_endpoint for S3 and DynamoDB.
+    why_it_matters: The specific missing-resource half of CMP-COST-002.
+    impact_band: moderate
+    estimation_method: As CMP-COST-002.
+    recommendation: Create both gateway endpoints.
+    tradeoffs: None.
+    validation: describe-vpc-endpoints returns empty for this VPC.
+
+  - id: CMP-COST-013
+    category: cost
+    subcategory: networking
+    severity: medium
+    confidence: low
+    file: terraform/networking.tf
+    resource: aws_nat_gateway.lab
+    evidence: A single NAT Gateway in public subnet 0 serving private subnets in two AZs.
+    why_it_matters: Traffic from the AZ-b private subnet crosses an AZ boundary to reach the NAT, incurring cross-AZ data transfer on top of NAT processing.
+    impact_band: low
+    estimation_method: cross_az_gb x cross_az_rate.
+    recommendation: >
+      One NAT per AZ removes the transfer charge but adds a second hourly charge —
+      only worth it above a break-even volume. Gateway endpoints (CMP-COST-016)
+      usually make this moot.
+    tradeoffs: Explicit cost trade-off between hourly charges and transfer charges.
+    validation: Cost Explorer filtered to the DataTransfer-Regional-Bytes usage type.
+
+  # =========================================================================
+  # COST — observability
+  # =========================================================================
+
+  - id: CMP-COST-010
+    category: cost
+    subcategory: observability
+    severity: high
+    confidence: medium
+    file: terraform/cloudwatch.tf
+    resource: aws_cloudwatch_log_group (7 instances)
+    evidence: retention_in_days = var.log_retention_days, default 0 ("never expire").
+    why_it_matters: Log data accumulates permanently across seven groups.
+    impact_band: low
+    estimation_method: monthly_gb x ingest_rate + cumulative_gb x storage_rate.
+    recommendation: >
+      Ingestion dominates the bill, so fix CMP-COST-014 first; then set retention to
+      14-30 days.
+    tradeoffs: Shorter retention limits historical incident investigation.
+    validation: CloudWatch IncomingBytes and StoredBytes per log group.
+
+  - id: CMP-COST-014
+    category: cost
+    subcategory: observability
+    severity: high
+    confidence: medium
+    files:
+      - src/cloud_pipeline/config.py
+      - src/cloud_pipeline/logging_utils.py
+      - terraform/locals.tf
+    evidence: >
+      LOG_FULL_PAYLOADS defaults to "true" and LOG_LEVEL to "DEBUG" in both config.py
+      and the Terraform lambda_environment block; log_payload serialises entire payloads.
+    why_it_matters: >
+      CloudWatch Logs bills on ingested GB. Full-payload DEBUG logging on every
+      message is the dominant driver, and it also causes CMP-SEC-007.
+    impact_band: low
+    estimation_method: avg_payload_kb x messages_per_month x ingest_rate.
+    recommendation: Default LOG_LEVEL to INFO and LOG_FULL_PAYLOADS to false; log identifiers, not bodies.
+    tradeoffs: Less forensic detail. Keep DEBUG behind a runtime-togglable flag.
+    validation: IncomingBytes per log group over 30 days.
+
+  - id: CMP-COST-036
+    category: cost
+    subcategory: observability
+    severity: medium
+    confidence: high
+    file: terraform/cloudwatch.tf
+    resource: aws_cloudwatch_log_group.worker_debug
+    evidence: A second log group capturing the same worker output as aws_cloudwatch_log_group.worker.
+    why_it_matters: Identical content ingested and stored twice.
+    impact_band: trivial
+    estimation_method: Duplicate group IncomingBytes x ingest rate.
+    recommendation: Delete the duplicate group and its writer.
+    tradeoffs: None.
+    validation: Compare IncomingBytes across the two groups.
+
+  - id: CMP-COST-037
+    category: cost
+    subcategory: observability
+    severity: medium
+    confidence: low
+    files:
+      - terraform/cloudwatch.tf
+      - src/cloud_pipeline/logging_utils.py
+    resource: aws_cloudwatch_log_metric_filter.job_events
+    evidence: >
+      Metric filter on the bare pattern "JOB", fed by log_job_event which emits a line
+      per job status transition.
+    why_it_matters: Custom metrics are billed per metric per month; an unconstrained filter creates unbounded cardinality.
+    impact_band: trivial
+    estimation_method: distinct_metric_count x custom_metric_rate.
+    recommendation: Narrow the pattern and constrain dimension values to a known enum.
+    tradeoffs: Fewer dimensions means less granular dashboards.
+    validation: "aws cloudwatch list-metrics --namespace SkyForgeLab/Jobs | count."
+
+  - id: CMP-COST-038
+    category: cost
+    subcategory: observability
+    severity: low
+    confidence: high
+    file: terraform/cloudwatch.tf
+    resource: aws_cloudwatch_metric_alarm.process_errors
+    evidence: period = 10 (high-resolution) on a Lambda Errors alarm.
+    why_it_matters: High-resolution alarms are billed at a significantly higher rate than standard alarms.
+    impact_band: trivial
+    estimation_method: Difference between high-resolution and standard alarm pricing.
+    recommendation: Use period = 300.
+    tradeoffs: Error spikes are detected slightly later.
+    validation: Review alarm configuration; confirm no sub-minute SLA exists.
+
+  - id: CMP-COST-039
+    category: cost
+    subcategory: observability
+    severity: low
+    confidence: high
+    file: terraform/cloudwatch.tf
+    resource: aws_cloudwatch_dashboard.lab
+    evidence: Two widgets rendering an identical Invocations metric.
+    why_it_matters: Dashboards beyond the free tier are billed per dashboard per month; duplicate widgets add query load for no benefit.
+    impact_band: trivial
+    estimation_method: dashboard_count x dashboard_rate.
+    recommendation: Remove the duplicate widget.
+    tradeoffs: None.
+    validation: Visual inspection of the dashboard body.
+
+  - id: CMP-COST-029
+    category: cost
+    subcategory: observability
+    severity: low
+    confidence: medium
+    file: terraform/lambda.tf
+    evidence: X-Ray active tracing documented as enabled on all functions including the highest-volume one.
+    why_it_matters: X-Ray is billed per recorded trace.
+    impact_band: trivial
+    estimation_method: traces_recorded x trace_rate.
+    recommendation: Sample at 5-10% on the process function; keep 100% on low-volume functions.
+    tradeoffs: Sampling may miss a rare failure trace.
+    validation: X-Ray TracesRecorded metric.
+
+  - id: CMP-COST-044
+    category: cost
+    subcategory: observability
+    severity: medium
+    confidence: medium
+    file: terraform/eventbridge.tf
+    resource: aws_cloudwatch_event_archive.jobs
+    evidence: retention_days = 0 (indefinite) with no replay consumer in the repository.
+    why_it_matters: Archive storage is billed per GB-month and grows forever.
+    impact_band: trivial
+    estimation_method: archived_gb x archive_rate x months.
+    recommendation: Set a finite retention, or delete the archive if replay is not a requirement.
+    tradeoffs: Loses event replay capability.
+    validation: describe-archive for SizeBytes and EventCount.
+
+  - id: CMP-COST-041
+    category: cost
+    subcategory: observability
+    severity: medium
+    confidence: medium
+    file: terraform/api_gateway.tf
+    resource: aws_apigatewayv2_stage.default
+    evidence: Full JSON access logging on every request into a never-expiring log group.
+    why_it_matters: For a high-volume API, access-log ingestion frequently exceeds the API request charge itself.
+    impact_band: low
+    estimation_method: requests_per_month x avg_log_line_bytes x ingest_rate.
+    recommendation: Keep access logs but set retention, or sample for high-volume routes.
+    tradeoffs: Reduced request-level audit trail.
+    validation: IncomingBytes on /aws/apigateway/cloud-pipeline.
+
+  - id: CMP-COST-043
+    category: cost
+    subcategory: scheduling
+    severity: high
+    confidence: high
+    files:
+      - terraform/eventbridge.tf
+      - src/cloud_pipeline/workers/cleanup_worker.py
+    resource: aws_cloudwatch_event_rule.cleanup_schedule
+    evidence: schedule_expression = "rate(5 minutes)" for a job that deletes objects older than 30 days.
+    why_it_matters: >
+      8,760 invocations a month, each performing an unpaginated S3 list and a full
+      DynamoDB scan, to act on data with a 30-day retention window.
+    impact_band: low
+    estimation_method: invocations x (Lambda cost + S3 LIST + DynamoDB Scan RRU).
+    recommendation: Move to rate(1 day), or delete the function entirely once S3 lifecycle and DynamoDB TTL are configured.
+    tradeoffs: Cleanup latency rises from minutes to a day — irrelevant at 30-day retention.
+    validation: Lambda Invocations and the function's own deleted-object count.
+
+  - id: CMP-COST-042
+    category: cost
+    subcategory: api
+    severity: high
+    confidence: high
+    file: terraform/api_gateway.tf
+    resource: aws_apigatewayv2_stage.default.default_route_settings
+    evidence: detailed_metrics_enabled = true with throttling_rate_limit and throttling_burst_limit unset.
+    why_it_matters: >
+      With no rate limit, a runaway client or retry storm can drive unbounded API
+      Gateway and Lambda cost. This is a cost-availability risk, not just a line item.
+    impact_band: low
+    estimation_method: Model a retry storm: requests/sec x duration x (API rate + Lambda rate).
+    recommendation: Set explicit throttling limits and add usage plans per consumer.
+    tradeoffs: Legitimate bursts are throttled; size the limits from observed p99 traffic.
+    validation: API Gateway Count and 4XX/5XX metrics; check for existing throttle configuration.
+
+  # =========================================================================
+  # COST — retry amplification (cross-cutting)
+  # =========================================================================
+
+  - id: CMP-COST-063
+    category: cost
+    subcategory: serverless
+    severity: critical
+    confidence: medium
+    file: src/cloud_pipeline/services/retry_service.py
+    symbol: retry_forever
+    evidence: >
+      "while True" with no attempt ceiling when config.MAX_RETRIES is 0 (the default),
+      a flat 100ms sleep, no backoff and no jitter. Called by queue_worker.poll_loop.
+    why_it_matters: >
+      A failing dependency pins the function for the full 900s timeout at 4096 MB,
+      then the message is redelivered up to 1000 more times. Combined with
+      CMP-COST-008 and CMP-COST-021 this is the largest cost-amplification path in
+      the repository. time.sleep inside Lambda is billed at full rate.
+    impact_band: moderate
+    estimation_method: >
+      failure_rate x duplication_factor x 900s x memory_gb x gb_second_rate. Measure
+      the duplication factor from SQS NumberOfMessagesReceived vs Lambda Invocations.
+    recommendation: >
+      Replace with retry_with_backoff (already implemented in the same module and
+      unused), bound attempts, add jitter, and distinguish retryable from terminal errors.
+    tradeoffs: None — the current behaviour has no legitimate use case.
+    validation: Lambda Duration p99 and the message-to-invocation ratio.
+
+  # =========================================================================
+  # SECURITY
+  # =========================================================================
+
+  - id: CMP-SEC-001
+    category: security
+    severity: critical
+    confidence: high
+    file: terraform/iam.tf
+    resource: aws_iam_role_policy.lambda_admin
+    evidence: 'Statement with actions = ["*"] and resources = ["*"].'
+    cwe: CWE-250
+    why_it_matters: >
+      All four Lambda functions share one role with full administrative access. Any
+      code-execution flaw in the least important function becomes account compromise.
+    recommendation: >
+      One role per function, scoped to the specific actions each needs. The process
+      function needs only s3:GetObject on input, s3:PutObject on output,
+      dynamodb:UpdateItem on the table, and the SQS receive/delete set.
+    validation: IAM Access Analyzer; CloudTrail-derived least-privilege policy generation.
+
+  - id: CMP-SEC-007
+    category: security
+    severity: high
+    confidence: high
+    files:
+      - src/cloud_pipeline/logging_utils.py
+      - src/cloud_pipeline/handler.py
+      - src/cloud_pipeline/services/ingest_service.py
+    symbol: log_payload
+    evidence: >
+      Entire event and payload objects serialised to logs with no redaction.
+      handler.ingest_handler logs the full event including headers (which carry the
+      Authorization / x-api-token value); ingest_service.submit logs the body
+      containing customer_email and callback_token.
+    cwe: CWE-532
+    why_it_matters: Credentials and personal data written in plaintext to log groups that never expire.
+    recommendation: Allow-list logged fields, redact token-shaped values, hash identifiers.
+    validation: Logs Insights query for "token" / "email" patterns in recent events.
+
+  - id: CMP-SEC-010
+    category: security
+    severity: high
+    confidence: high
+    files:
+      - src/cloud_pipeline/services/ingest_service.py
+      - src/cloud_pipeline/workers/queue_worker.py
+    symbol: build_job_record
+    evidence: >
+      object_key taken verbatim from caller input and used directly as an S3 key in
+      queue_worker.process_message. validate_submission never inspects it.
+    cwe: CWE-22
+    why_it_matters: >
+      A caller-controlled key lets the submitter steer reads and writes to arbitrary
+      objects within the bucket. The role's s3:* permission (CMP-SEC-008) widens this further.
+    recommendation: Validate against a strict allow-list pattern and prefix the key server-side.
+    validation: Submit the traversal fixture in fixtures/sample_records.json and observe it is accepted.
+
+  - id: CMP-SEC-015
+    category: security
+    severity: high
+    confidence: high
+    file: src/cloud_pipeline/handler.py
+    symbol: ingest_handler
+    evidence: 'Exception handler returns {"error": str(exc), "trace": traceback.format_exc()}.'
+    cwe: CWE-209
+    why_it_matters: File paths, module names and library versions are returned to unauthenticated callers.
+    recommendation: Log the trace with a correlation ID; return only that ID to the caller.
+    validation: Trigger a malformed S3 notification and inspect the HTTP response body.
+
+  - id: CMP-SEC-012
+    category: security
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/handler.py
+    symbol: ingest_handler
+    evidence: 'if supplied != config.get_token()'
+    cwe: CWE-208
+    why_it_matters: String inequality short-circuits on the first differing byte, leaking timing information.
+    recommendation: Use hmac.compare_digest.
+    validation: Static analysis; code review of the comparison.
+
+  - id: CMP-SEC-013
+    category: security
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/handler.py
+    symbol: ingest_handler
+    evidence: '403 response body includes "expected_length": len(config.get_token()).'
+    cwe: CWE-209
+    why_it_matters: Disclosing the expected token length materially narrows a brute-force search.
+    recommendation: Return a bare 403 with no detail.
+    validation: Send a bad token and inspect the response body.
+
+  - id: CMP-SEC-006
+    category: security
+    severity: high
+    confidence: high
+    file: src/cloud_pipeline/config.py
+    symbol: FALLBACK_API_TOKEN
+    evidence: >
+      A committed default token returned by get_token() whenever REPORT_API_TOKEN is
+      unset. The value is an obvious placeholder; the pattern is the finding.
+    cwe: CWE-798
+    why_it_matters: A misconfigured deployment silently authenticates against a value published in this repository.
+    recommendation: Fail closed when the secret is absent. Never ship a credential default.
+    validation: Unset REPORT_API_TOKEN and confirm the endpoint still authenticates.
+
+  - id: CMP-SEC-004
+    category: security
+    severity: high
+    confidence: high
+    files:
+      - src/cloud_pipeline/config.py
+      - terraform/locals.tf
+      - terraform/variables.tf
+    evidence: >
+      REPORT_API_TOKEN passed through local.lambda_environment into every function's
+      environment block; var.report_api_token has no sensitive = true marking.
+    cwe: CWE-522
+    why_it_matters: >
+      Lambda environment variables are readable by anyone with
+      lambda:GetFunctionConfiguration and are stored in plaintext Terraform state.
+    recommendation: Use Secrets Manager or an SSM SecureString, fetched at runtime and cached.
+    validation: get-function-configuration and inspect the Environment block.
+
+  - id: CMP-SEC-011
+    category: security
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/services/billing_service.py
+    symbol: sign_invoice
+    evidence: 'hashlib.md5(f"{key}{payload}".encode()) used as an integrity signature.'
+    cwe: CWE-328
+    why_it_matters: MD5 is collision-prone and naive key-prefix concatenation is vulnerable to length extension.
+    recommendation: Use hmac.new(key, msg, hashlib.sha256).
+    validation: Bandit B324; code review.
+
+  - id: CMP-SEC-002
+    category: security
+    severity: high
+    confidence: high
+    file: terraform/security_groups.tf
+    resource: aws_security_group_rule.worker_debug_open
+    evidence: 'cidr_blocks = ["0.0.0.0/0"] on TCP 9229 (Node inspector port).'
+    cwe: CWE-284
+    why_it_matters: Exposes a debug port to the entire IPv4 internet.
+    mitigating_control: Gated behind var.enable_open_security_group, which defaults to false.
+    recommendation: Delete the rule, or restrict to a bastion CIDR.
+    validation: describe-security-groups and inspect ingress rules.
+
+  - id: CMP-SEC-009
+    category: security
+    severity: high
+    confidence: high
+    file: terraform/s3.tf
+    resource: aws_s3_bucket_public_access_block.output
+    evidence: All four block settings driven by var.enable_public_bucket_lab.
+    cwe: CWE-732
+    why_it_matters: Enabling the flag disables every public-access protection on a bucket holding customer reports.
+    mitigating_control: Defaults to false.
+    recommendation: Hard-code all four settings to true.
+    validation: get-public-access-block on the output bucket.
+
+  - id: CMP-SEC-021
+    category: security
+    severity: high
+    confidence: high
+    file: terraform/api_gateway.tf
+    resource: aws_apigatewayv2_route.submit_public
+    evidence: 'authorization_type = "NONE" on a route that writes to S3 and DynamoDB.'
+    cwe: CWE-306
+    why_it_matters: An anonymous write endpoint on the public internet, with no WAF (CMP-SEC-022) and no throttling (CMP-COST-042).
+    mitigating_control: Gated behind var.enable_public_api, which defaults to false.
+    recommendation: Delete the route; keep the AWS_IAM-authorised route only.
+    validation: get-routes and inspect AuthorizationType.
+
+  # =========================================================================
+  # CODE HEALTH
+  # =========================================================================
+
+  - id: CMP-CODE-046
+    category: code_health
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/handler.py
+    symbol: ingest_handler
+    evidence: >
+      ~90 lines mixing event-shape detection, body parsing, authentication,
+      validation, persistence and response construction, with six return points.
+    why_it_matters: >
+      No seam exists to test any single responsibility, which is a direct cause of the
+      56% coverage on this file. Cyclomatic complexity is suppressed by the ruff
+      ignore list (CMP-CFG-002), so it never surfaces in lint.
+    recommendation: Extract event normalisation, authentication and response building into separate functions.
+    validation: "ruff check --select C901 with the ignore removed; radon cc."
+
+  - id: CMP-CODE-026
+    category: code_health
+    severity: high
+    confidence: high
+    files:
+      - src/cloud_pipeline/services/report_service.py
+      - src/cloud_pipeline/services/billing_service.py
+    symbols: [summarise, aggregate_for_billing]
+    evidence: >
+      Two near-identical aggregation implementations that have already drifted:
+      report_service counts status "FAILED", billing_service counts "ERROR". Both
+      statuses are produced elsewhere in the codebase.
+    why_it_matters: >
+      The operational report and the invoice disagree about how many jobs failed, and
+      neither is correct. This is a correctness bug caused by duplication, not just a
+      style issue.
+    recommendation: Extract one aggregation function and a single status enum shared by both callers.
+    validation: Run both functions over fixtures/sample_records.json and compare failure counts.
+
+  - id: CMP-CODE-037
+    category: code_health
+    severity: high
+    confidence: high
+    file: src/cloud_pipeline/repositories/job_repository.py
+    symbol: is_duplicate
+    evidence: Idempotency check against the module-level PROCESSED_JOBS dict.
+    why_it_matters: >
+      Lambda runs many concurrent containers, so this catches only duplicates landing
+      on the same container. Combined with CMP-COST-008 (visibility timeout shorter
+      than the function timeout) duplicate processing is routine, not exceptional.
+    recommendation: >
+      Conditional write against DynamoDB
+      (ConditionExpression="attribute_not_exists(job_id)") or a dedicated idempotency table.
+    validation: Replay the same message twice concurrently and observe both are processed.
+
+  - id: CMP-CODE-010
+    category: code_health
+    severity: high
+    confidence: high
+    files:
+      - src/cloud_pipeline/clients/s3_client.py
+      - src/cloud_pipeline/workers/cleanup_worker.py
+    symbol: list_objects
+    evidence: list_objects_v2 called without handling ContinuationToken.
+    why_it_matters: >
+      Capped at 1000 keys. Once either bucket exceeds that, cleanup silently operates
+      on an arbitrary subset and reports success, so storage grows unbounded while
+      monitoring looks healthy.
+    recommendation: Use the list_objects_v2 paginator.
+    validation: Create 1001 objects under a prefix and count what the function returns.
+
+  - id: CMP-CODE-041
+    category: code_health
+    severity: critical
+    confidence: high
+    file: src/cloud_pipeline/workers/queue_worker.py
+    symbol: handle_sqs_event
+    evidence: 'Exception handler returns {"statusCode": 200, ...} after a batch failure.'
+    why_it_matters: >
+      Reporting success to Lambda causes SQS to delete the messages, so unprocessed
+      work is lost silently. Silent data loss presented as success is the most
+      dangerous failure mode in this codebase. CMP-CODE-030 (safe_call) and
+      CMP-CODE-044 (run_cleanup) follow the same pattern.
+    recommendation: >
+      Re-raise, or return batchItemFailures with the failed message IDs and set
+      function_response_types = ["ReportBatchItemFailures"] on the event source mapping.
+    validation: Force a mid-batch exception and check whether messages reach the DLQ.
+
+  - id: CMP-CODE-043
+    category: code_health
+    severity: medium
+    confidence: high
+    file: src/cloud_pipeline/workers/cleanup_worker.py
+    symbol: write_cleanup_manifest
+    evidence: NamedTemporaryFile(delete=False) never closed and never removed.
+    why_it_matters: >
+      Lambda /tmp is 512 MB and persists across warm invocations, so the container
+      eventually fails every invocation with ENOSPC.
+    recommendation: Use a context manager and delete the file, or write the manifest to S3.
+    validation: Invoke repeatedly against a warm container and watch /tmp usage.
+
+  # =========================================================================
+  # DEPENDENCIES
+  # =========================================================================
+
+  - id: CMP-DEP-001
+    category: dependency
+    severity: medium
+    confidence: high
+    file: pyproject.toml
+    evidence: 'boto3>=1.26,<1.27 and botocore>=1.29,<1.30 — pinned to a single old minor series.'
+    why_it_matters: >
+      An upper bound this tight blocks routine patch and security updates. NO CVE IS
+      CLAIMED HERE — run "make audit" (pip-audit) for actual advisory data.
+    recommendation: Relax to a compatible-release constraint and update regularly.
+    validation: "pip-audit, and pip index versions boto3."
+
+  - id: CMP-DEP-002
+    category: dependency
+    severity: low
+    confidence: high
+    file: pyproject.toml
+    evidence: 'httpx>=0.23 with no upper bound.'
+    why_it_matters: >
+      An unbounded constraint permits a future major release with breaking changes to
+      install silently. The opposite failure mode to CMP-DEP-001, in the same file.
+    recommendation: Add an upper bound and use a lockfile for reproducible builds.
+    validation: Resolve the dependency tree on a clean environment.
+
+  # =========================================================================
+  # TEST COVERAGE
+  # =========================================================================
+
+  - id: CMP-TEST-001
+    category: test_coverage
+    severity: high
+    confidence: high
+    files:
+      - unit-tests/test_handler.py
+      - unit-tests/test_ingest_service.py
+      - functional-tests/test_pipeline_smoke.py
+    evidence: >
+      MEASURED: 43% line coverage, 12 passing tests, 1 skipped. Zero coverage of
+      billing_service (0%); retry_service at 18%; queue_worker at 22%; cleanup_worker
+      at 26%; the three AWS clients between 28% and 40%.
+    why_it_matters: >
+      Every failure path that matters is untested: duplicate delivery, partial batch
+      failure, S3 pagination past 1000 keys, the unbounded retry loop, malformed
+      events, and AWS error responses. The uncovered lines map almost exactly onto
+      the highest-severity findings above.
+    recommendation: >
+      Prioritise tests for CMP-CODE-041 (silent message loss), CMP-CODE-037
+      (idempotency) and CMP-CODE-010 (pagination) first — all three are correctness
+      bugs with production impact.
+    validation: "make coverage, then read benchmark/scoring-rubric.md for the full missing-scenario list."
+
+  # =========================================================================
+  # CONFIGURATION
+  # =========================================================================
+
+  - id: CMP-CFG-002
+    category: configuration
+    severity: medium
+    confidence: high
+    file: pyproject.toml
+    evidence: >
+      ruff lint ignore list contains C901 (complexity), S105/S106 (hardcoded
+      secrets), E501, B008 and S608. Bandit skips B101 and B311.
+    why_it_matters: >
+      The tooling is configured to suppress precisely the findings this repository
+      contains. A clean lint run here is evidence of nothing. Always check analyser
+      configuration before trusting a clean result.
+    recommendation: Remove the suppressions and triage the output.
+    validation: Run ruff and bandit with the ignore and skip lists emptied, and compare counts.
+

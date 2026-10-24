@@ -1,0 +1,229 @@
+# Expected resource and event graph for cloud-media-pipeline.
+#
+# Use this to score architecture-analysis output: an analyser that reasons across
+# files should be able to reconstruct these nodes and edges from the Terraform
+# and Python sources alone.
+
+metadata:
+  repository: cloud-media-pipeline
+  schema_version: 1
+  region: eu-west-2
+  name_prefix: cloud-pipeline
+
+entrypoints:
+  - id: api_gateway
+    type: aws_apigatewayv2_api
+    file: terraform/api_gateway.tf
+    routes:
+      - key: "POST /jobs"
+        auth: AWS_IAM
+      - key: "POST /public/jobs"
+        auth: NONE
+        conditional_on: var.enable_public_api
+  - id: s3_upload_notification
+    type: aws_s3_bucket_notification
+    file: terraform/s3.tf
+    trigger: "s3:ObjectCreated:* on prefix uploads/"
+  - id: report_schedule
+    type: aws_cloudwatch_event_rule
+    file: terraform/eventbridge.tf
+    schedule: "rate(1 minute)"
+  - id: cleanup_schedule
+    type: aws_cloudwatch_event_rule
+    file: terraform/eventbridge.tf
+    schedule: "rate(5 minutes)"
+
+compute:
+  - id: lambda_ingest
+    type: aws_lambda_function
+    file: terraform/lambda.tf
+    handler: cloud_pipeline.handler.ingest_handler
+    memory_mb: 3008
+    timeout_s: 900
+    role: aws_iam_role.lambda_exec
+  - id: lambda_process
+    type: aws_lambda_function
+    file: terraform/lambda.tf
+    handler: cloud_pipeline.handler.process_handler
+    memory_mb: 4096
+    timeout_s: 900
+    reserved_concurrency: 200
+    provisioned_concurrency: 20
+    vpc_attached: true
+    role: aws_iam_role.lambda_exec
+  - id: lambda_report
+    type: aws_lambda_function
+    file: terraform/lambda.tf
+    handler: cloud_pipeline.handler.report_handler
+    memory_mb: 2048
+    timeout_s: 900
+    role: aws_iam_role.lambda_exec
+  - id: lambda_cleanup
+    type: aws_lambda_function
+    file: terraform/lambda.tf
+    handler: cloud_pipeline.handler.cleanup_handler
+    memory_mb: 1024
+    timeout_s: 900
+    role: aws_iam_role.lambda_exec
+  - id: ec2_worker
+    type: aws_instance
+    file: terraform/ec2.tf
+    instance_type: m5.4xlarge
+    conditional_on: var.enable_ec2_worker
+    role: aws_iam_role.worker
+    runs: cloud_pipeline.workers.queue_worker.poll_loop
+
+storage:
+  - id: s3_input
+    type: aws_s3_bucket
+    file: terraform/s3.tf
+    versioning: enabled
+    noncurrent_retention_days: 1825
+    prefixes: [uploads/, working/, archive/]
+  - id: s3_output
+    type: aws_s3_bucket
+    file: terraform/s3.tf
+    prefixes: [processed/, reports/, temp/]
+  - id: dynamodb_jobs
+    type: aws_dynamodb_table
+    file: terraform/dynamodb.tf
+    billing_mode: PAY_PER_REQUEST
+    hash_key: job_id
+    range_key: created_at
+    ttl_enabled: false
+    indexes:
+      - name: status-index
+        projection: ALL
+        queried_by: "nothing (dynamodb_client.query_by_status is dead code)"
+      - name: customer-index
+        projection: ALL
+        queried_by: "nothing (callers scan and filter in Python)"
+
+messaging:
+  - id: sqs_jobs
+    type: aws_sqs_queue
+    file: terraform/sqs.tf
+    long_polling: false
+    visibility_timeout_s: 30
+    max_receive_count: 1000
+    dlq: sqs_jobs_dlq
+  - id: sqs_jobs_dlq
+    type: aws_sqs_queue
+    file: terraform/sqs.tf
+    retention_s: 1209600
+    consumer: none
+  - id: sqs_billing_fifo
+    type: aws_sqs_queue
+    file: terraform/sqs.tf
+    fifo: true
+    consumer: none
+  - id: eventbridge_bus
+    type: aws_cloudwatch_event_bus
+    file: terraform/eventbridge.tf
+    archive_retention_days: 0
+    replay_consumer: none
+
+networking:
+  - id: vpc
+    type: aws_vpc
+    file: terraform/networking.tf
+    cidr: 10.42.0.0/16
+    azs: 2
+  - id: nat_gateway
+    type: aws_nat_gateway
+    file: terraform/networking.tf
+    conditional_on: var.enable_nat_gateway
+    count: 1
+    note: "single NAT serving two AZs; no S3/DynamoDB gateway endpoints exist"
+
+# Event flow. Each edge should be derivable by following code, not just Terraform.
+flows:
+  - from: api_gateway
+    to: lambda_ingest
+    via: aws_apigatewayv2_integration (AWS_PROXY)
+  - from: s3_input
+    to: lambda_ingest
+    via: bucket notification on uploads/
+  - from: lambda_ingest
+    to: dynamodb_jobs
+    via: ingest_service.submit -> dynamodb_client.put_job
+  - from: lambda_ingest
+    to: sqs_jobs
+    via: ingest_service.submit -> sqs_client.send_message
+  - from: sqs_jobs
+    to: lambda_process
+    via: aws_lambda_event_source_mapping (batch_size 1)
+  - from: lambda_process
+    to: s3_input
+    via: queue_worker.process_message -> get_object_bytes + 2x copy_object
+  - from: lambda_process
+    to: s3_output
+    via: queue_worker.process_message -> put_object (processed/)
+  - from: lambda_process
+    to: dynamodb_jobs
+    via: job_repository.mark_processing / mark_complete
+  - from: sqs_jobs
+    to: sqs_jobs_dlq
+    via: redrive_policy after 1000 receives
+  - from: report_schedule
+    to: lambda_report
+    via: aws_cloudwatch_event_target
+  - from: lambda_report
+    to: dynamodb_jobs
+    via: report_service.generate_report -> scan_all_jobs (FULL SCAN)
+  - from: lambda_report
+    to: s3_output
+    via: 2x put_object (timestamped key + latest.json)
+  - from: cleanup_schedule
+    to: lambda_cleanup
+    via: aws_cloudwatch_event_target
+  - from: lambda_cleanup
+    to: s3_input
+    via: cleanup_worker.find_stale_objects (unpaginated) + per-key delete
+  - from: lambda_cleanup
+    to: dynamodb_jobs
+    via: job_repository.list_expired (FULL SCAN) + per-item delete
+  - from: ec2_worker
+    to: sqs_jobs
+    via: queue_worker.poll_loop (short polling, unbounded retry)
+
+# Relationships an analyser must reason across files to find.
+cross_file_findings:
+  - id: CMP-COST-008
+    spans: [terraform/sqs.tf, terraform/lambda.tf]
+    reasoning: "visibility_timeout_seconds (30) must be compared against the Lambda timeout (900) defined in a different file."
+  - id: CMP-COST-011
+    spans: [terraform/eventbridge.tf, src/cloud_pipeline/services/report_service.py]
+    reasoning: "Schedule frequency is only expensive because the handler it triggers performs a full table scan."
+  - id: CMP-COST-007
+    spans: [terraform/sqs.tf, src/cloud_pipeline/clients/sqs_client.py]
+    reasoning: "Long polling must be enabled in both the queue config and the client call."
+  - id: CMP-COST-024
+    spans: [terraform/dynamodb.tf, src/cloud_pipeline/services/ingest_service.py]
+    reasoning: "ALL projection is only costly because the application stores a large raw_payload attribute."
+  - id: CMP-COST-002
+    spans: [terraform/networking.tf, src/cloud_pipeline/clients/s3_client.py]
+    reasoning: "NAT data processing charges arise from S3 traffic that gateway endpoints would eliminate."
+  - id: CMP-COST-004
+    spans: [terraform/variables.tf, src/cloud_pipeline/clients/s3_client.py]
+    reasoning: "4096 MB is required only because get_object_bytes reads whole objects into memory."
+  - id: CMP-CODE-026
+    spans: [src/cloud_pipeline/services/report_service.py, src/cloud_pipeline/services/billing_service.py]
+    reasoning: "Duplicated aggregation logic has drifted; FAILED vs ERROR must be compared across both files."
+  - id: CMP-SEC-010
+    spans: [src/cloud_pipeline/services/ingest_service.py, src/cloud_pipeline/workers/queue_worker.py]
+    reasoning: "Unvalidated object_key at ingest becomes an S3 key in a different module."
+
+# Resources that exist but nothing consumes. Dead infrastructure.
+orphans:
+  - resource: aws_sqs_queue.billing_fifo
+    reason: no producer or consumer in the repository
+  - resource: aws_dynamodb_table.jobs stream
+    reason: stream_enabled true, no consumer
+  - resource: aws_cloudwatch_event_bus.jobs
+    reason: no rules target this bus
+  - resource: aws_eip.worker_reserved
+    reason: never associated
+  - resource: status-index / customer-index
+    reason: maintained at full ALL projection cost, never queried
+

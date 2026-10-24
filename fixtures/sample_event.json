@@ -1,0 +1,28 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /jobs",
+  "rawPath": "/jobs",
+  "headers": {
+    "content-type": "application/json",
+    "x-api-token": "REPLACE_ME_PLACEHOLDER_NOT_A_REAL_SECRET",
+    "user-agent": "cloud-media-pipeline-benchmark/0.3.0"
+  },
+  "requestContext": {
+    "accountId": "000000000000",
+    "apiId": "benchmarkapi",
+    "http": {
+      "method": "POST",
+      "path": "/jobs",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "192.0.2.10",
+      "userAgent": "cloud-media-pipeline-benchmark/0.3.0"
+    },
+    "requestId": "00000000-0000-4000-8000-000000000001",
+    "stage": "$default",
+    "time": "01/Jan/2026:00:00:00 +0000",
+    "timeEpoch": 1767225600000
+  },
+  "body": "{\"customer_id\":\"cust-0001\",\"customer_email\":\"person-0001@example.invalid\",\"media_format\":\"mp4\",\"object_key\":\"uploads/sample-0001.mp4\",\"width\":1920,\"height\":1080,\"callback_url\":\"https://example.invalid/hooks/0001\",\"callback_token\":\"REPLACE_ME_PLACEHOLDER_NOT_A_REAL_SECRET\"}",
+  "isBase64Encoded": false
+}
+
